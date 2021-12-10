@@ -326,6 +326,7 @@ External library support:
   --enable-vulkan          enable Vulkan code [no]
   --disable-xlib           disable xlib [autodetect]
   --disable-zlib           disable zlib [autodetect]
+  --enable-webrtc          enabled webrtc [no]
 
   The following libraries provide various hardware acceleration features:
   --disable-amf            disable AMF video encoding code [autodetect]
@@ -1829,6 +1830,7 @@ EXTERNAL_LIBRARY_LIST="
     opengl
     pocketsphinx
     vapoursynth
+    libdatachannel
 "
 
 HWACCEL_AUTODETECT_LIBRARY_LIST="
@@ -3492,6 +3494,7 @@ udp_protocol_select="network"
 udplite_protocol_select="network"
 unix_protocol_deps="sys_un_h"
 unix_protocol_select="network"
+webrtc_protocol_deps="libdatachannel"
 
 # external library protocols
 libamqp_protocol_deps="librabbitmq"
@@ -6330,6 +6333,7 @@ for func in $COMPLEX_FUNCS; do
 done
 
 # these are off by default, so fail if requested and not available
+enabled libdatachannel    && require_pkg_config libdatachannel datachannel rtc/rtc.h rtcPreload
 enabled avisynth          && require_headers "avisynth/avisynth_c.h"
 enabled cuda_nvcc         && { check_nvcc cuda_nvcc || die "ERROR: failed checking for nvcc."; }
 enabled chromaprint       && require chromaprint chromaprint.h chromaprint_get_version -lchromaprint

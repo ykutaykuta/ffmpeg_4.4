@@ -1,0 +1,11 @@
+#ifndef AVFORMAT_WEBRTCPROTO_H
+#define AVFORMAT_WEBRTCPROTO_H
+
+#define UDP_TX_BUF_SIZE 32768
+#define UDP_RX_BUF_SIZE 393216
+#define UDP_MAX_PKT_SIZE 65536
+#define UDP_HEADER_SIZE 8
+
+#include "url.h"
+
+#endif /* AVFORMAT_WEBRTCPROTO_H */
