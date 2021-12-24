@@ -3,10 +3,106 @@
 #include "libavutil/intreadwrite.h"
 #include "network.h"
 #include "libavcodec/get_bits.h"
+#include "libavcodec/h264.h"
 
 #define RTP_MIN_HEADER_SIZE 12
 
 #define RECVBUF_SIZE 10240
+#define MAX_FRAGMENT_SIZE 20480
+
+/**
+ * Single-time aggregation packet
+ * https://datatracker.ietf.org/doc/rfc3984/
+ */
+#define STAP_A H264_NAL_UNSPECIFIED24
+#define STAP_B H264_NAL_UNSPECIFIED25
+
+/**
+ * Multi-time aggregation packet
+ */
+#define MTAP_16 H264_NAL_UNSPECIFIED26
+#define MTAP_24 H264_NAL_UNSPECIFIED28
+
+/**
+ * Fragmentation unit
+ */
+#define FU_A H264_NAL_UNSPECIFIED28
+#define FU_B H264_NAL_UNSPECIFIED29
+
+static int webrtc_read_nal_stap_a(WebrtcDemuxContext *ctx, AVPacket *pkt, const uint8_t *buf, int len)
+{
+    int rv, nal_size, pkt_pos = 0, curr_pos = 0, pkt_size = 0;
+    while (curr_pos < len)
+    {
+        nal_size = AV_RB16(buf + curr_pos);
+        pkt_size += 4 + nal_size;
+        curr_pos += 2 + nal_size;
+    }
+    if (rv = av_new_packet(pkt, pkt_size) < 0)
+        return rv;
+
+    curr_pos = 0;
+    pkt_pos = 0;
+    while (curr_pos < len)
+    {
+        nal_size = AV_RB16(buf + curr_pos);
+        curr_pos += 2;
+        pkt->data[pkt_pos] = pkt->data[pkt_pos + 1] = pkt->data[pkt_pos + 2] = 0;
+        pkt->data[pkt_pos + 3] = 1;
+        pkt_pos += 4;
+        memcpy(pkt->data + pkt_pos, buf + curr_pos, nal_size);
+        av_log(NULL, AV_LOG_INFO, "ykuta %s nal_hdr: %d\n", __func__, buf[curr_pos]);
+        pkt_pos += nal_size;
+        curr_pos += nal_size;
+    }
+    return 0;
+}
+
+static int webrtc_read_nal_fu_a(WebrtcDemuxContext *ctx, AVPacket *pkt, const uint8_t *buf, int len, uint8_t nal_ref_idc)
+{
+    uint8_t S_bit = buf[0] & 0x80;
+    uint8_t E_bit = buf[0] & 0x40;
+    uint8_t nal_unit_type = buf[0] & 0x1f;
+    len -= 1;
+    buf += 1;
+    if (S_bit)
+    {
+        ctx->fragment_len = 0;
+        ctx->fragment_unit[0] = ctx->fragment_unit[1] = ctx->fragment_unit[2] = 0;
+        ctx->fragment_unit[3] = 1;
+        ctx->fragment_unit[4] = (nal_ref_idc << 5) | nal_unit_type;
+        ctx->fragment_len += 5;
+    }
+    memcpy(ctx->fragment_unit + ctx->fragment_len, buf, len);
+    ctx->fragment_len += len;
+    if (E_bit)
+    {
+        int rv = av_new_packet(pkt, ctx->fragment_len);
+        if (rv < 0)
+            return rv;
+        memcpy(pkt->data, ctx->fragment_unit, ctx->fragment_len);
+    }
+    return 0;
+}
+
+static int webrtc_read_payload_type_102(WebrtcDemuxContext *ctx, AVPacket *pkt, const uint8_t *buf, int len)
+{
+    uint8_t nal_ref_idc, nal_unit_type;
+    uint8_t nal_hdr = buf[0];
+    if (nal_hdr & 0x80)
+        return 0;
+    nal_ref_idc = (nal_hdr & 0x60) >> 5;
+    nal_unit_type = nal_hdr & 0x1F;
+    if (nal_unit_type == STAP_A)
+    {
+        return webrtc_read_nal_stap_a(ctx, pkt, buf + 1, len - 1);
+    }
+    else if (nal_unit_type = FU_A)
+    {
+        return webrtc_read_nal_fu_a(ctx, pkt, buf + 1, len - 1, nal_unit_type);
+    }
+    return 0;
+}
 
 static int parse_rtp_buffer_to_packet_internal(WebrtcDemuxContext *ctx, AVPacket *pkt, const uint8_t *buf, int len)
 {
@@ -72,14 +168,14 @@ static int parse_rtp_buffer_to_packet_internal(WebrtcDemuxContext *ctx, AVPacket
     switch (payload_type)
     {
     case 102:
-        if ((rv = av_new_packet(pkt, len + 4)) < 0)
+        if (!ctx->v_start_ts)
+            ctx->v_start_ts = timestamp;
+        if (rv = webrtc_read_payload_type_102(ctx, pkt, buf + curr_pos, len) < 0)
             return rv;
-        pkt->stream_index = ctx->v_stream_index;
-        pkt->data[0] = pkt->data[1] = pkt->data[2] = 0;
-        pkt->data[3] = 1;
-        memcpy(pkt->data + 4, buf + curr_pos, len);
         break;
     case 111:
+        if (!ctx->a_start_ts)
+            ctx->a_start_ts = timestamp;
         if ((rv = av_new_packet(pkt, len)) < 0)
             return rv;
         pkt->stream_index = ctx->a_stream_index;
@@ -88,7 +184,7 @@ static int parse_rtp_buffer_to_packet_internal(WebrtcDemuxContext *ctx, AVPacket
     default:
         break;
     }
-    av_log(NULL, AV_LOG_INFO, "ykuta pkt->data %d %d %d %d %d len: %d\n", buf[curr_pos], buf[curr_pos + 1], buf[curr_pos + 2], buf[curr_pos + 3], buf[curr_pos + 4], len);
+    av_log(NULL, AV_LOG_INFO, "ykuta len: %d\n", len);
 
     return 0;
 }
@@ -123,6 +219,14 @@ static int webrtc_read_header(AVFormatContext *s)
         goto fail;
     }
 
+    ctx->fragment_unit = av_malloc(MAX_FRAGMENT_SIZE);
+    if (!ctx->fragment_unit)
+    {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+    ctx->fragment_len = 0;
+
     v_st = avformat_new_stream(s, NULL);
     a_st = avformat_new_stream(s, NULL);
     ctx->v_stream_index = 0;
@@ -146,6 +250,7 @@ fail:
     ffurl_closep(&in);
     ff_network_close();
     av_freep(&ctx->recvbuf);
+    av_freep(&ctx->fragment_unit);
     return ret;
 }
 
@@ -177,6 +282,7 @@ static int webrtc_read_close(AVFormatContext *s)
     ffurl_closep(&ctx->webrtc_hd);
     ff_network_close();
     av_freep(&ctx->recvbuf);
+    av_freep(&ctx->fragment_unit);
     return 0;
 }
 
