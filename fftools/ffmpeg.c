@@ -2672,8 +2672,10 @@ static int process_input_packet(InputStream *ist, const AVPacket *pkt, int no_eo
             av_packet_unref(avpkt);
             break;
         case AVMEDIA_TYPE_VIDEO:
+            av_log(NULL, AV_LOG_INFO, "ykuta before avpkt->side_data_elems: %d\n", avpkt->side_data_elems);
             ret = decode_video    (ist, repeating ? NULL : avpkt, &got_output, &duration_pts, !pkt,
                                    &decode_failed);
+            av_log(NULL, AV_LOG_INFO, "ykuta after avpkt->side_data_elems: %d\n", avpkt->side_data_elems);
             if (!repeating || !pkt || got_output) {
                 if (pkt && pkt->duration) {
                     duration_dts = av_rescale_q(pkt->duration, ist->st->time_base, AV_TIME_BASE_Q);
@@ -2799,6 +2801,7 @@ static int process_input_packet(InputStream *ist, const AVPacket *pkt, int no_eo
         if (!check_output_constraints(ist, ost) || ost->encoding_needed)
             continue;
 
+        av_log(NULL, AV_LOG_INFO, "ykuta pkt->side_data_elems: %d\n", pkt->side_data_elems);
         do_streamcopy(ist, ost, pkt);
     }
 

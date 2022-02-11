@@ -2420,6 +2420,16 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
     HLSContext *hls = s->priv_data;
     AVFormatContext *oc = NULL;
     AVStream *st = s->streams[pkt->stream_index];
+    av_log(NULL, AV_LOG_INFO, "ykuta %s AVFormatContext %p AVPacket %p\n", __func__, s, pkt);
+    int idx;
+    for (idx = 0; idx < s->nb_streams; idx++)
+    {
+        av_log(NULL, AV_LOG_INFO, "ykuta AVStream %d %p\n", idx, s->streams[idx]);
+    }
+    for (idx = 0; idx < pkt->side_data_elems; idx++)
+    {
+        av_log(NULL, AV_LOG_INFO, "ykuta side_data idx %d type %d size %d\n", idx, pkt->side_data[idx].type, pkt->side_data[idx].size);
+    }
     int64_t end_pts = 0;
     int is_ref_pkt = 1;
     int ret = 0, can_split = 1, i, j;

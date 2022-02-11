@@ -125,6 +125,16 @@ struct Program {
     int pmt_found;
 };
 
+typedef struct EBP_Partition
+{
+    int partition_id;
+    int EBP_PID;
+    float EBP_distance_second;
+    int SAP_type_max;
+    int acquisition_time_flag;
+    uint64_t representation_id;
+} EBP_Partition;
+
 struct MpegTSContext {
     const AVClass *class;
     /* user data */
@@ -177,6 +187,9 @@ struct MpegTSContext {
 
     AVStream *epg_stream;
     AVBufferPool* pools[32];
+
+    EBP_Partition *ebp_parititons;
+    int nb_partition;
 };
 
 #define MPEGTS_OPTIONS \
@@ -361,6 +374,47 @@ static void update_av_program_info(AVFormatContext *s, unsigned int programid,
             break;
         }
     }
+}
+
+static void clear_partition(EBP_Partition *p)
+{
+    if (!p)
+        return;
+    p->partition_id = 0;
+    p->EBP_PID = 0;
+    p->EBP_distance_second = 0.0f;
+    p->SAP_type_max = 0;
+    p->acquisition_time_flag = 0;
+    p->representation_id = 0;
+}
+
+static EBP_Partition* get_ebp_partition(MpegTSContext *ts, int partition_id)
+{
+    int i;
+    for (i = 0; i < ts->nb_partition; i++)
+    {
+        if (ts->ebp_parititons[i].partition_id == partition_id)
+        {
+            return &ts->ebp_parititons[i];
+        }
+    }
+    return NULL;
+}
+
+static EBP_Partition* add_ebp_partition(MpegTSContext *ts, int partition_id)
+{
+    EBP_Partition *p = get_ebp_partition(ts, partition_id);
+    if (p)
+        return p;
+    if (av_reallocp_array(&ts->ebp_parititons, ts->nb_partition + 1, sizeof(*ts->ebp_parititons)) < 0) {
+        ts->nb_partition = 0;
+        return NULL;
+    }
+    p = &ts->ebp_parititons[ts->nb_partition];
+    clear_partition(p);
+    p->partition_id = partition_id;
+    ts->nb_partition++;
+    return p;
 }
 
 /**
@@ -684,6 +738,34 @@ static inline int get16(const uint8_t **pp, const uint8_t *p_end)
     return c;
 }
 
+static inline int get24(const uint8_t **pp, const uint8_t *p_end)
+{
+    const uint8_t *p;
+    int c;
+
+    p = *pp;
+    if (2 >= p_end - p)
+        return AVERROR_INVALIDDATA;
+    c   = AV_RB24(p);
+    p  += 3;
+    *pp = p;
+    return c;
+}
+
+static inline uint64_t get64(const uint8_t **pp, const uint8_t *p_end)
+{
+    const uint8_t *p;
+    int c;
+
+    p = *pp;
+    if (7 >= p_end - p)
+        return AVERROR_INVALIDDATA;
+    c   = AV_RB64(p);
+    p  += 8;
+    *pp = p;
+    return c;
+}
+
 /* read and allocate a DVB string preceded by its length */
 static char *getstr8(const uint8_t **pp, const uint8_t *p_end)
 {
@@ -944,6 +1026,7 @@ static int mpegts_set_stream_info(AVStream *st, PESContext *pes,
             sub_st->codecpar->codec_id   = AV_CODEC_ID_AC3;
             sub_st->need_parsing      = AVSTREAM_PARSE_FULL;
             sub_pes->sub_st           = pes->sub_st = sub_st;
+            av_log(NULL, AV_LOG_INFO, "ykuta add stream codec id %d to %p\n", AV_CODEC_ID_AC3, pes->stream);
         }
     }
     if (st->codecpar->codec_id == AV_CODEC_ID_NONE)
@@ -1181,6 +1264,7 @@ static int mpegts_push_data(MpegTSFilter *filter,
                             return AVERROR(ENOMEM);
                         pes->st->id = pes->pid;
                         mpegts_set_stream_info(pes->st, pes, 0, 0);
+                        av_log(NULL, AV_LOG_INFO, "ykuta add stream codec id %d to %p\n", pes->st->codecpar->codec_id, ts->stream);
                     }
 
                     pes->total_size = AV_RB16(pes->header + 4);
@@ -1854,6 +1938,78 @@ int ff_parse_mpeg2_descriptor(AVFormatContext *fc, AVStream *st, int stream_type
             }
         }
         break;
+    case EBP_DESCRIPTOR:
+    {
+        av_log(NULL, AV_LOG_INFO, "ykuta has PMT has EBP_DESCRIPTOR\n");
+        int num_partitions, timescale_flag, EBP_data_explicit_flag, representation_id_flag;
+        int partition_id, EBP_PID, boundary_flag, SAP_type_max, acquisition_time_flag;
+        uint64_t tmp, EBP_distance, representation_id;
+        int ticks_per_second = 1, EBP_distance_width_minus_1 = 0;
+        tmp = get8(pp, desc_end);
+        if (tmp < 0)
+            return tmp;
+        num_partitions = tmp >> 3;
+        timescale_flag = (tmp >> 2) & 0x01;
+        if (timescale_flag)
+        {
+            tmp = get24(pp, desc_end);
+            if (tmp < 0)
+                return tmp;
+            ticks_per_second = tmp >> 3;
+            EBP_distance_width_minus_1 = tmp & 0x07;
+        }
+        for (i = 0; i < num_partitions; i++)
+        {
+            EBP_Partition *p;
+            tmp = get8(pp, desc_end);
+            if (tmp < 0)
+                return tmp;
+            EBP_data_explicit_flag = tmp >> 7;
+            representation_id_flag = (tmp >> 6) & 0x01;
+            partition_id = (tmp >> 1) & 0x1f;
+            p = add_ebp_partition(ts, partition_id);
+            if (EBP_data_explicit_flag)
+            {
+                boundary_flag = tmp & 0x01;
+                EBP_distance = 0;
+                for (i = 0; i <= EBP_distance_width_minus_1; i++)
+                {
+                    tmp = get8(pp, desc_end);
+                    if (tmp < 0)
+                        return tmp;
+                    EBP_distance = (EBP_distance << 8) & tmp;
+                }
+                tmp = get8(pp, desc_end);
+                if (tmp < 0)
+                    return tmp;
+                if (boundary_flag)
+                {
+                    SAP_type_max = tmp >> 5;
+                }
+                acquisition_time_flag = tmp & 0x01;
+                p->SAP_type_max = SAP_type_max;
+                p->acquisition_time_flag = acquisition_time_flag;
+                p->EBP_distance_second = EBP_distance / ticks_per_second;
+            }
+            else
+            {
+                tmp = get16(pp, desc_end);
+                if (tmp < 0)
+                    return tmp;
+                EBP_PID = tmp >> 3;
+                p->EBP_PID = EBP_PID;
+            }
+            if (representation_id_flag)
+            {
+                tmp = get64(pp, desc_end);
+                if (tmp < 0)
+                    return tmp;
+                representation_id = tmp;
+                p->representation_id = representation_id;
+            }
+        }
+    }
+    break;
     case 0x56: /* DVB teletext descriptor */
         {
             uint8_t *extradata = NULL;
@@ -2397,6 +2553,7 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
                 }
             }
             if (!pes->st) {
+                av_log(NULL, AV_LOG_INFO, "ykuta if\n");
                 pes->st = avformat_new_stream(pes->stream, NULL);
                 if (!pes->st)
                     goto out;
@@ -2416,6 +2573,7 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
                 }
             }
             if (pes && !pes->st) {
+                av_log(NULL, AV_LOG_INFO, "ykuta elif\n");
                 st = avformat_new_stream(pes->stream, NULL);
                 if (!st)
                     goto out;
@@ -2430,6 +2588,7 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
                 st = find_matching_stream(ts, pid, h->id, stream_identifier, i, &old_program);
             }
             if (!st) {
+                av_log(NULL, AV_LOG_INFO, "ykuta else\n");
                 st = avformat_new_stream(ts->stream, NULL);
                 if (!st)
                     goto out;
@@ -2445,9 +2604,10 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
         if (!st)
             goto out;
 
-        if (pes && !pes->stream_type)
+        if (pes && !pes->stream_type) {
             mpegts_set_stream_info(st, pes, stream_type, prog_reg_desc);
-
+            av_log(NULL, AV_LOG_INFO, "ykuta add stream codec id %d to %p or %p\n", st->codecpar->codec_id, ts->stream, pes->stream);
+        }
         add_pid_to_program(prg, pid);
         if (prg) {
             prg->streams[i].idx = st->index;
@@ -2591,6 +2751,7 @@ static void eit_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
         ts->epg_stream->id = EIT_PID;
         ts->epg_stream->codecpar->codec_type = AVMEDIA_TYPE_DATA;
         ts->epg_stream->codecpar->codec_id = AV_CODEC_ID_EPG;
+        av_log(NULL, AV_LOG_INFO, "ykuta add stream codec id %d to %p\n", ts->epg_stream->codecpar->codec_id, ts->stream);
     }
 
     if (ts->epg_stream->discard == AVDISCARD_ALL)
@@ -2714,6 +2875,91 @@ static void sdt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
 static int parse_pcr(int64_t *ppcr_high, int *ppcr_low,
                      const uint8_t *packet);
 
+static int parse_ebp(MpegTSContext *ts, const uint8_t *in_buf)
+{
+    int flags, tmp;
+    uint64_t EBP_acquisition_time;
+    int EBP_ext_partition_flag = 0, EBP_SAP_type = 0, EBP_ext_partitions = 0;
+    uint8_t *p = in_buf[1];
+    int len = *p++;
+    uint8_t *p_end = p + len;
+    uint32_t format_identifier = AV_RB32(p);
+    p += 4;
+    if (p_end >= p || (format_identifier != MKBETAG('E', 'B', 'P', '0')))
+        return AVERROR_INVALIDDATA;
+    flags = *p++;
+    if (flags & 0x01)
+    {
+        tmp = *p++;
+        EBP_ext_partition_flag = tmp >> 7;
+    }
+    if (flags & 0x20)
+    {
+        tmp = *p++;
+        EBP_SAP_type = tmp >> 5;
+    }
+    // skip EBP_grouping_id
+    if (flags & 0x10)
+    {
+        tmp = *p++;
+        while (tmp >> 7)
+        {
+            tmp = *p++;
+        }
+    }
+    if (flags & 0x80)
+    {
+        EBP_acquisition_time = AV_RB64(p);
+        p += 8;
+    }
+    if (EBP_ext_partition_flag)
+    {
+        EBP_ext_partitions = *p++;
+    }
+
+    return 0;
+}
+
+/**
+ * @param ts        pointer to MpegTSContext
+ * @param in_buf    pointer to input mpeg-ts buffer at adaptation field control
+ */
+static int parse_afc_transport_private_data(MpegTSContext *ts, const uint8_t *in_buf)
+{
+    int len, flags;
+    const uint8_t *p_end;
+    const uint8_t *p = in_buf;
+    len = *p++;
+    p_end = p + len;
+    flags = *p++;
+    if ((p >= p_end))
+        return AVERROR_INVALIDDATA;
+    if (flags & 0x10)
+        p += 6;
+    if (flags & 0x08)
+        p += 6;
+    if (flags & 0x04)
+        p += 1;
+    if ((p >= p_end))
+        return AVERROR_INVALIDDATA;
+    if (!(flags & 0x02))
+    {
+        av_log(ts, AV_LOG_INFO, "adaptation field not contains transport private data\n");
+        return 0;
+    }
+    len = *p++;
+
+    // handle transport private data
+    switch (p[0])
+    {
+    case 0xDF:
+        return parse_ebp(ts, p);
+    default:
+        av_log(ts, AV_LOG_INFO, "adaptation field transport private data type was not supported\n");
+    }
+    return 0;
+}
+
 /* handle one TS packet */
 static int handle_packet(MpegTSContext *ts, const uint8_t *packet, int64_t pos)
 {
@@ -2779,7 +3025,13 @@ static int handle_packet(MpegTSContext *ts, const uint8_t *packet, int64_t pos)
         int pcr_l;
         if (parse_pcr(&pcr_h, &pcr_l, packet) == 0)
             tss->last_pcr = pcr_h * 300 + pcr_l;
+        if (parse_afc_transport_private_data(ts, p) < 0) {
+            av_log(ts, AV_LOG_INFO, "parse parse_afc_transport_private_data failed\n");
+        } else {
+            av_log(ts, AV_LOG_INFO, "parse parse_afc_transport_private_data successfully\n");
+        }
         /* skip adaptation field */
+        av_log(ts, AV_LOG_INFO, "ykuta adaptation field p[0]: %x and p[1]: %x\n", p[0], p[1]);
         p += p[0] + 1;
     }
     /* if past the end of packet, ignore */
@@ -2793,6 +3045,7 @@ static int handle_packet(MpegTSContext *ts, const uint8_t *packet, int64_t pos)
     }
 
     if (tss->type == MPEGTS_SECTION) {
+        av_log(NULL, AV_LOG_INFO, "ykuta tss->type == MPEGTS_SECTION\n");
         if (is_start) {
             /* pointer field present */
             len = *p++;
@@ -2841,6 +3094,7 @@ static int handle_packet(MpegTSContext *ts, const uint8_t *packet, int64_t pos)
         }
 
     } else {
+        av_log(NULL, AV_LOG_INFO, "ykuta tss->type != MPEGTS_SECTION\n");
         int ret;
         // Note: The position here points actually behind the current packet.
         if (tss->type == MPEGTS_PES) {
@@ -3114,6 +3368,7 @@ static int mpegts_read_header(AVFormatContext *s)
         avpriv_set_pts_info(st, 60, 1, 27000000);
         st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
         st->codecpar->codec_id   = AV_CODEC_ID_MPEG2TS;
+        av_log(NULL, AV_LOG_INFO, "ykuta add stream codec id %d to %p\n", st->codecpar->codec_id, s);
 
         /* we iterate until we find two PCRs to estimate the bitrate */
         pcr_pid    = -1;
@@ -3215,9 +3470,19 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
     MpegTSContext *ts = s->priv_data;
     int ret, i;
 
+    av_log(NULL, AV_LOG_INFO, "ykuta %s AVFormatContext %p AVPacket %p\n", __func__, s, pkt);
+    int idx;
+    for (idx = 0; idx < s->nb_streams; idx++)
+    {
+        av_log(NULL, AV_LOG_INFO, "ykuta AVStream %d %p\n", idx, s->streams[idx]);
+    }
     pkt->size = -1;
     ts->pkt = pkt;
     ret = handle_packets(ts, 0);
+    for (idx = 0; idx < pkt->side_data_elems; idx++)
+    {
+        av_log(NULL, AV_LOG_INFO, "ykuta side_data idx %d type %d size %d\n", idx, pkt->side_data[idx].type, pkt->side_data[idx].size);
+    }
     if (ret < 0) {
         av_packet_unref(ts->pkt);
         /* flush pes data left */
