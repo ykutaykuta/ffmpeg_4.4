@@ -1509,6 +1509,9 @@ static int parse_packet(AVFormatContext *s, AVPacket *pkt,
         if (st->parser->key_frame == -1 && st->parser->pict_type ==AV_PICTURE_TYPE_NONE && (pkt->flags&AV_PKT_FLAG_KEY))
             out_pkt->flags |= AV_PKT_FLAG_KEY;
 
+        if ((out_pkt->flags & AV_PKT_FLAG_KEY) && st->parser->idr_frame)
+            out_pkt->flags |= AV_PKT_FLAG_IDR;
+
         compute_pkt_fields(s, st, st->parser, out_pkt, next_dts, next_pts);
 
         ret = avpriv_packet_list_put(&s->internal->parse_queue,

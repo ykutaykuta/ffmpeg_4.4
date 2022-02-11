@@ -259,6 +259,7 @@ static inline int parse_nal_units(AVCodecParserContext *s,
     /* set some sane default values */
     s->pict_type         = AV_PICTURE_TYPE_I;
     s->key_frame         = 0;
+    s->idr_frame         = 0;
     s->picture_structure = AV_PICTURE_STRUCTURE_UNKNOWN;
 
     ff_h264_sei_uninit(&p->sei);
@@ -334,6 +335,7 @@ static inline int parse_nal_units(AVCodecParserContext *s,
             break;
         case H264_NAL_IDR_SLICE:
             s->key_frame = 1;
+            s->idr_frame = 1;
 
             p->poc.prev_frame_num        = 0;
             p->poc.prev_frame_num_offset = 0;

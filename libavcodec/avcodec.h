@@ -3424,6 +3424,7 @@ typedef struct AVCodecParserContext {
      * will be used.
      */
     int key_frame;
+    int idr_frame;
 
 #if FF_API_CONVERGENCE_DURATION
     /**
